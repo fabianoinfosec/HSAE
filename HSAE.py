@@ -1,38 +1,48 @@
 import time
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, BatchNormalization, Dropout, LeakyReLU
 from tensorflow.keras.optimizers import Adam
-from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve
 
 def build_hybrid_autoencoder(input_dim):
     input_layer = Input(shape=(input_dim,))
     encoded = Dense(1024, kernel_regularizer=tf.keras.regularizers.l2(0.0001))(input_layer)
-    encoded = LeakyReLU(negative_slope=0.1)(encoded)
+    encoded = LeakyReLU(alpha=0.1)(encoded)
     encoded = BatchNormalization()(encoded)
-    encoded = Dropout(0.5)(encoded)  
+    encoded = Dropout(0.5)(encoded)
     encoded = Dense(512)(encoded)
-    encoded = LeakyReLU(negative_slope=0.1)(encoded)
+    encoded = LeakyReLU(alpha=0.1)(encoded)
     encoded = BatchNormalization()(encoded)
     encoded = Dropout(0.3)(encoded)
     encoded = Dense(256)(encoded)
-    encoded = LeakyReLU(negative_slope=0.1)(encoded)
+    encoded = LeakyReLU(alpha=0.1)(encoded)
     decoded = Dense(512)(encoded)
-    decoded = LeakyReLU(negative_slope=0.1)(decoded)
+    decoded = LeakyReLU(alpha=0.1)(decoded)
     decoded = Dense(1024)(decoded)
-    decoded = LeakyReLU(negative_slope=0.1)(decoded)
-    output_layer = Dense(input_dim, activation='relu')(decoded)
+    decoded = LeakyReLU(alpha=0.1)(decoded)
+    output_layer = Dense(input_dim)(decoded)
     anomaly_score = Dense(1, activation='sigmoid', name="anomaly_score")(encoded)
     autoencoder = Model(input_layer, [output_layer, anomaly_score])
-    
     def hybrid_loss(y_true, y_pred):
         reconstruction_loss = tf.reduce_mean(tf.square(y_true[0] - y_pred[0]))
         classification_loss = tf.keras.losses.BinaryCrossentropy()(y_true[1], y_pred[1])
-        return reconstruction_loss + 0.03 * classification_loss 
-    
+        return reconstruction_loss + 0.03 * classification_loss
     autoencoder.compile(optimizer=Adam(learning_rate=0.00005), loss=hybrid_loss)
     return autoencoder
+
+def calculate_eer_threshold(y_true, scores):
+    fpr_values, tpr_values, thresholds = roc_curve(y_true, scores)
+    fnr_values = 1 - tpr_values
+    eer_differences = np.abs(fpr_values - fnr_values)
+    min_diff_idx = np.argmin(eer_differences)
+    eer_threshold = thresholds[min_diff_idx]
+    eer_value = fpr_values[min_diff_idx]
+    return eer_threshold, eer_value, fpr_values[min_diff_idx], fnr_values[min_diff_idx]
 
 hybrid_autoencoder = build_hybrid_autoencoder(X_train_scaled.shape[1])
 y_train = [X_train_scaled, y_train_labels.reshape(-1, 1)]
@@ -46,10 +56,14 @@ hybrid_autoencoder.fit(
     validation_split=0.2
 )
 
-start_time = time.time()
-X_test_reconstructed, X_test_anomaly = hybrid_autoencoder.predict(X_test_scaled)
+X_val_reconstructed, X_val_anomaly = hybrid_autoencoder.predict(X_val_scaled)
+val_reconstruction_errors = np.mean(np.abs(X_val_scaled - X_val_reconstructed), axis=1)
+val_reconstruction_errors_norm = val_reconstruction_errors / val_reconstruction_errors.max()
+combined_scores_val = 0.5 * val_reconstruction_errors_norm + 0.5 * X_val_anomaly.flatten()
+eer_threshold, eer_value, _, _ = calculate_eer_threshold(y_val_labels, combined_scores_val)
 
+X_test_reconstructed, X_test_anomaly = hybrid_autoencoder.predict(X_test_scaled)
 test_reconstruction_errors = np.mean(np.abs(X_test_scaled - X_test_reconstructed), axis=1)
-threshold = np.percentile(test_reconstruction_errors, 75)
-y_pred = (test_reconstruction_errors > threshold).astype(int)
-y_pred = np.round((0.5 * y_pred + 0.5 * X_test_anomaly.flatten()))
+test_reconstruction_errors_norm = test_reconstruction_errors / test_reconstruction_errors.max()
+combined_scores_test = 0.5 * test_reconstruction_errors_norm + 0.5 * X_test_anomaly.flatten()
+y_pred = (combined_scores_test >= eer_threshold).astype(int)
